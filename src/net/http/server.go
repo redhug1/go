@@ -629,7 +629,6 @@ func (srv *Server) newConn(rwc net.Conn) *conn {
 }
 
 type readResult struct {
-	_   incomparable
 	n   int
 	err error
 	b   byte // byte read, if n == 1
@@ -1777,6 +1776,11 @@ func (c *conn) serve(ctx context.Context) {
 			c.close()
 			c.setState(c.rwc, StateClosed)
 		}
+		if sLimits.doAllocationLimiting {
+			sLimits.mu.Lock()
+			sLimits.numberOfActiveGoRoutines--
+			sLimits.mu.Unlock()
+		}
 	}()
 
 	if tlsConn, ok := c.rwc.(*tls.Conn); ok {
@@ -2578,9 +2582,8 @@ type Server struct {
 	// value.
 	ConnContext func(ctx context.Context, c net.Conn) context.Context
 
-	inShutdown atomicBool // true when when server is in shutdown
-
 	disableKeepAlives int32     // accessed atomically.
+	inShutdown        int32     // accessed atomically (non-zero means we're in Shutdown)
 	nextProtoOnce     sync.Once // guards setupHTTP2_* init
 	nextProtoErr      error     // result of http2.ConfigureServer if used
 
@@ -2626,7 +2629,7 @@ func (s *Server) closeDoneChanLocked() {
 // Close returns any error returned from closing the Server's
 // underlying Listener(s).
 func (srv *Server) Close() error {
-	srv.inShutdown.setTrue()
+	atomic.StoreInt32(&srv.inShutdown, 1)
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 	srv.closeDoneChanLocked()
@@ -2668,7 +2671,7 @@ var shutdownPollInterval = 500 * time.Millisecond
 // Once Shutdown has been called on a server, it may not be reused;
 // future calls to methods such as Serve will return ErrServerClosed.
 func (srv *Server) Shutdown(ctx context.Context) error {
-	srv.inShutdown.setTrue()
+	atomic.StoreInt32(&srv.inShutdown, 1)
 
 	srv.mu.Lock()
 	lnerr := srv.closeListenersLocked()
@@ -2681,7 +2684,7 @@ func (srv *Server) Shutdown(ctx context.Context) error {
 	ticker := time.NewTicker(shutdownPollInterval)
 	defer ticker.Stop()
 	for {
-		if srv.closeIdleConns() && srv.numListeners() == 0 {
+		if srv.closeIdleConns() {
 			return lnerr
 		}
 		select {
@@ -2701,12 +2704,6 @@ func (srv *Server) RegisterOnShutdown(f func()) {
 	srv.mu.Lock()
 	srv.onShutdown = append(srv.onShutdown, f)
 	srv.mu.Unlock()
-}
-
-func (s *Server) numListeners() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.listeners)
 }
 
 // closeIdleConns closes all idle connections and reports whether the
@@ -2741,6 +2738,7 @@ func (s *Server) closeListenersLocked() error {
 		if cerr := (*ln).Close(); cerr != nil && err == nil {
 			err = cerr
 		}
+		delete(s.listeners, ln)
 	}
 	return err
 }
@@ -2861,6 +2859,54 @@ func (srv *Server) shouldConfigureHTTP2ForServe() bool {
 	return strSliceContains(srv.TLSConfig.NextProtos, http2NextProtoTLS)
 }
 
+type serveLimits struct {
+	// gate limit checking
+	doAllocationLimiting bool
+
+	// limit for number of active go routines
+	limitOfActiveGoRoutines int32
+
+	// provide 503 response when at max number of go routines
+	do503 bool
+
+	// mu guards numberOfActiveGoRoutines
+	mu sync.Mutex
+
+	// number of go routines running that were launched by serve()
+	// called from ListenAndServe()
+	numberOfActiveGoRoutines int32
+}
+
+var sLimits serveLimits
+
+// SetListenAndServeLimits allows the maximum number of go routines
+// launched from serve() to be limited, thus constraining maximum memory
+// allocations.
+// Calling it enables limit checking. Once checks are enabled,
+// they can not be stopped.
+//
+// It "MUST" be called before calling ListenAndServe()
+//
+// For best results increase the rate of garbage collection with:
+//
+//		debug.SetGCPercent(10)
+//
+// Calling it with 'doResponse' as false further reduces memory growth.
+func SetListenAndServeLimits(limitActive int32, doResponse bool) {
+	sLimits.doAllocationLimiting = true
+	sLimits.limitOfActiveGoRoutines = limitActive
+	sLimits.do503 = doResponse
+}
+
+// GetActiveGoRoutineCount is to be used for polling and logging in a
+// 'foreground' handler function that gets called back to from serve().
+// You can the filter your logs and plot.
+func GetActiveGoRoutineCount() int32 {
+	sLimits.mu.Lock()
+	defer sLimits.mu.Unlock()
+	return sLimits.numberOfActiveGoRoutines
+}
+
 // ErrServerClosed is returned by the Server's Serve, ServeTLS, ListenAndServe,
 // and ListenAndServeTLS methods after a call to Shutdown or Close.
 var ErrServerClosed = errors.New("http: Server closed")
@@ -2937,6 +2983,21 @@ func (srv *Server) Serve(l net.Listener) error {
 		tempDelay = 0
 		c := srv.newConn(rw)
 		c.setState(c.rwc, StateNew) // before Serve can return
+
+		if sLimits.doAllocationLimiting {
+			if GetActiveGoRoutineCount() >= sLimits.limitOfActiveGoRoutines {
+				if sLimits.do503 {
+					const errorHeaders = "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n"
+					const publicErr = "503 Service Unavailable"
+					fmt.Fprintf(c.rwc, "HTTP/1.1 "+publicErr+errorHeaders+publicErr)
+					c.closeWriteAndWait()
+				}
+				continue
+			}
+			sLimits.mu.Lock()
+			sLimits.numberOfActiveGoRoutines++
+			sLimits.mu.Unlock()
+		}
 		go c.serve(connCtx)
 	}
 }
@@ -3039,7 +3100,9 @@ func (s *Server) doKeepAlives() bool {
 }
 
 func (s *Server) shuttingDown() bool {
-	return s.inShutdown.isSet()
+	// TODO: replace inShutdown with the existing atomicBool type;
+	// see https://github.com/golang/go/issues/20239#issuecomment-381434582
+	return atomic.LoadInt32(&s.inShutdown) != 0
 }
 
 // SetKeepAlivesEnabled controls whether HTTP keep-alives are enabled.
